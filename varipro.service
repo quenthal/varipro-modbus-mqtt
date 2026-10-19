@@ -1,0 +1,15 @@
+[Unit]
+Description=VariPro Modbus-MQTT Bridge
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+EnvironmentFile=-/etc/varipro.env
+ExecStart=/usr/bin/python3 /opt/varipro_bridge.py
+Restart=always
+RestartSec=5
+User=root
+
+[Install]
+WantedBy=multi-user.target
