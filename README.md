@@ -10,6 +10,10 @@ laajennettu kuollut alue) eikä tuota kunnollista toiminta- ja hälytystietoa. T
 silta hoitaa koko laitteen yhtenä siistinä entiteettinä ja lisää joukon
 diagnostiikkasensoreita.
 
+<p align="center">
+  <img src="docs/climate-card.png" alt="VariPro climate-kortti Home Assistantissa" width="420">
+</p>
+
 > Kehitetty iteratiivisesti Claude-tekoälyn avustuksella, oikealla laitteella testaten.
 
 ## Ominaisuudet
@@ -22,6 +26,13 @@ diagnostiikkasensoreita.
 - **Diagnostiikkasensorit** — jäähdytys-/lämmitys-PID, vesien tulo/lähtö, aktiivinen asetusarvo, puhaltimen toteutunut tila, huonelämpötila
 - **Poissa-tilan kuollut alue** säädettävänä number-entiteettinä
 - **Optimoitu väyläkäyttö** — peräkkäiset rekisterit luetaan ryhmissä, porrastetut pollausvälit, välimuisti ja kevyt kirjoitussuojaus estävät UI:n välkkymisen
+
+Laite näkyy Home Assistantissa yhtenä laitteena, jonka alla on climate-entiteetti
+sekä diagnostiikka- ja hälytyssensorit:
+
+<p align="center">
+  <img src="docs/device-page.png" alt="VariPro-laitteen sivu: entiteetit ja sensorit" width="640">
+</p>
 
 ## Vaatimukset
 
