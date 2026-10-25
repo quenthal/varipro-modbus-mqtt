@@ -6,10 +6,31 @@ Wants=network-online.target
 [Service]
 Type=simple
 EnvironmentFile=-/etc/varipro.env
-ExecStart=/usr/bin/python3 /opt/varipro_bridge.py
+ExecStart=/opt/varipro-modbus-mqtt/.venv/bin/varipro-bridge
 Restart=always
 RestartSec=5
-User=root
+# SIGTERM -> silta palauttaa fan only -tilan ja julkaisee offline-tilan
+TimeoutStopSec=30
+
+# Ei roottina: oma dynaaminen käyttäjä, tilatiedosto /var/lib/varipro/
+DynamicUser=yes
+StateDirectory=varipro
+
+# Kovennukset. Jos palvelu kaatuu LXC-kontissa virheeseen 226/NAMESPACE,
+# salli kontille nesting (Proxmox: Options -> Features -> nesting) tai
+# kommentoi DynamicUser ja alla olevat rivit pois ja käytä User=-riviä.
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+RestrictNamespaces=yes
+LockPersonality=yes
+SystemCallFilter=@system-service
 
 [Install]
 WantedBy=multi-user.target
