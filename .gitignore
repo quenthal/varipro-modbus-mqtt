@@ -18,3 +18,9 @@ venv/
 .DS_Store
 .idea/
 .vscode/
+
+# Työkalut
+.pytest_cache/
+.ruff_cache/
+build/
+dist/

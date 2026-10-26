@@ -2,829 +2,957 @@
 """
 VariPro Modbus-MQTT silta
 - Lukee peräkkäiset rekisterit yhdellä kyselyllä, porrastetut pollausvälit
-- Välimuisti + kevyt kirjoitussuojaus pomppimisen vähentämiseksi
+- Kaikki väyläliikenne yhdessä säikeessä, vähintään 200 ms kyselyjen välissä
+- Kirjoitussuoja: kirjoituksen jälkeen laitteelta luettu vanha arvo ohitetaan
 - Preset-tuki home/away (erilliset tavoitelämpötilarekisterit 3 ja 4)
-- Action state jäähdytyksen PID-lähdöstä (rekisteri 9)
+- Action state jäähdytyksen/lämmityksen PID-lähdöstä (rekisterit 9 ja 10)
 - Hälytysbittien purku binary-sensoreiksi
 - Away-tilan kuollut alue säädettävänä (holding 201 / 4x00202, skaalaus x0.1 varmistettu)
 - Fan only -tila (synteettinen: away + kuollut alue 15 °C, tilannekuva levylle)
+- Availability: silta (MQTT LWT) ja Modbus-yhteys erikseen
 
 Laite: Chiller VariPro -huonesäädin (GRAND/BOX/STUDIO VariPro -puhallinkonvektorit)
 Rekisterikartta: VariPro-käyttöliittymän rekisterikartta v1.4 (N03104128)
 
-Konfiguraatio: aseta ympäristömuuttujat tai muokkaa alla olevia oletuksia.
-  VARIPRO_MODBUS_HOST   Modbus TCP -osoite (oletus 192.168.1.100)
-  VARIPRO_MODBUS_PORT   portti (oletus 502)
-  VARIPRO_MQTT_HOST     MQTT-brokerin osoite (oletus 192.168.1.10)
-  VARIPRO_MQTT_PORT     portti (oletus 1883)
-  VARIPRO_MQTT_USER     käyttäjä (valinnainen)
-  VARIPRO_MQTT_PASS     salasana (valinnainen)
-  VARIPRO_SLAVE         Modbus slave -osoite (oletus 1)
+Konfiguraatio ympäristömuuttujilla, ks. README.md tai Config.from_env().
 
 Lisenssi: MIT. Kehitetty iteratiivisesti Claude-tekoälyn avustuksella.
 """
 
-import os
-import time
 import json
 import logging
-from datetime import datetime, timedelta
-from pymodbus.client import ModbusTcpClient
-import paho.mqtt.client as mqtt
+import os
+import queue
+import signal
+import threading
+import time
+from dataclasses import dataclass
+from datetime import datetime
+
+__version__ = "2026.10.1"
+
+logger = logging.getLogger("varipro")
+
+# Holding-rekisterit (0-pohjaiset, 4x00001 = 0)
+REG_MODE = 0
+REG_FAN = 2
+REG_TARGET_HOME = 3
+REG_TARGET_AWAY = 4
+REG_DEADZONE = 201
+
+# Sovellustila (rekisteri 0)
+MODE_OFF = 1
+MODE_NORMAL = 2
+MODE_AWAY = 3
+MODE_TO_HVAC = {MODE_OFF: 'off', MODE_NORMAL: 'cool', MODE_AWAY: 'cool'}
+
+FAN_TO_RAW = {'off': 0, 'low': 1, 'medium': 2, 'high': 3, 'auto': 4}
+RAW_TO_FAN = {v: k for k, v in FAN_TO_RAW.items()}
+
+APP_STATE_TEXT = {0: 'Alustus', 1: 'Valmiustila', 2: 'Normaali', 3: 'Poissa',
+                  4: 'Huuhtelu', 5: 'Pysähtynyt', 10: 'Testitila'}
+FAN_ACTUAL_TEXT = {0: 'Pois', 1: 'Matala', 2: 'Keskitaso', 3: 'Korkea', 4: 'Auto'}
+
+# Hälytysbitit (3x00103): (bitti, avain, nimi)
+ALARM_BITS = [
+    (0,  'kondenssi',          'Kondenssianturin hälytys'),
+    (1,  'puhallin1_rpm',      'Puuttuva kierrosluku, puhallin 1'),
+    (2,  'puhallin2_rpm',      'Puuttuva kierrosluku, puhallin 2'),
+    (3,  'anturi_vesi_sisaan', 'Anturivika, vesi sisään'),
+    (4,  'anturi_vesi_ulos',   'Anturivika, vesi ulos'),
+    (11, 'parametritiedosto',  'Parametritiedosto'),
+    (15, 'suodatin',           'Suodattimen puhdistus'),
+]
+
+FANONLY_DEADZONE_RAW = 150   # 15.0 °C
+DEFAULT_DEADZONE_RAW = 20    # 2.0 °C, jos oikeaa arvoa ei ole vielä luettu
+WRITE_GUARD_S = 15           # näin kauan kirjoituksen jälkeen eroava lukema tulkitaan vanhaksi
+MODBUS_FAIL_LIMIT = 3        # peräkkäiset lukuvirheet ennen kuin Modbus merkitään offline-tilaan
+
+REPO_URL = "https://github.com/quenthal/varipro-modbus-mqtt"
 
 
-class OptimizedVariProBridge:
-    def __init__(self):
-        self.logger = logging.getLogger(__name__)
+def scale10(raw):
+    return round(raw * 0.1, 1)
 
-        # Konfiguraatio (ympäristömuuttujat tai oletukset)
-        self.modbus_host = os.environ.get('VARIPRO_MODBUS_HOST', '192.168.1.100')
-        self.modbus_port = int(os.environ.get('VARIPRO_MODBUS_PORT', '502'))
-        self.mqtt_host = os.environ.get('VARIPRO_MQTT_HOST', '192.168.1.10')
-        self.mqtt_port = int(os.environ.get('VARIPRO_MQTT_PORT', '1883'))
-        self.mqtt_user = os.environ.get('VARIPRO_MQTT_USER', '')
-        self.mqtt_pass = os.environ.get('VARIPRO_MQTT_PASS', '')
-        self.slave = int(os.environ.get('VARIPRO_SLAVE', '1'))
 
-        # Optimointi
-        self.min_poll_delay = 0.2  # 200ms ryhmien välillä (manuaalin vaatimus)
-        self.cache = {}
-        self.last_poll = {}
+def to_raw10(value):
+    return int(round(float(value) * 10))
 
-        # Kevyt kirjoitussuojaus - vain äskettäin kirjoitetut rekisterit
-        self.recent_writes = {}  # {rekisteri: (arvo, aika)}
 
-        # Fan only -tila
-        self.fan_only_active = False
-        self.fanonly_snapshot = None
-        self.fanonly_file = os.path.join(
-            os.path.dirname(os.path.abspath(__file__)), 'varipro_fanonly.json')
-        self.FANONLY_DEADZONE_RAW = 150  # 15.0 °C
-        self.last_fanonly_rewrite = datetime.min
+# ----------------------------------------------------------------------
+# Konfiguraatio
+# ----------------------------------------------------------------------
 
-        # Rekisteriryhmät - lue peräkkäiset kerralla
-        self.register_groups = [
-            {
-                'name': 'holding_main',
-                'type': 'holding',
-                'start': 0,
-                'count': 5,  # 0-4: sovellustila, -, fan-komento, target home, target away
-                'interval': 10,
-                'registers': [
-                    (0, 'mode', self.map_mode),
-                    (1, None, None),  # Skip (ei määritelty)
-                    (2, 'fan', self.map_fan),
-                    (3, 'temp/target', lambda x: round(x * 0.1, 1)),      # 4x00004 Home target
-                    (4, 'temp/target_away', lambda x: round(x * 0.1, 1))  # 4x00005 Away target
-                ]
-            },
-            {
-                'name': 'holding_deadzone',
-                'type': 'holding',
-                'start': 201,  # 4x00202 Poissa-tilan kuollut alue (skaalaus x0.1 varmistettu)
-                'count': 1,
-                'interval': 60,
-                'registers': [
-                    (201, 'deadzone', lambda x: round(x * 0.1, 1))
-                ]
-            },
-            {
-                'name': 'input_main',
-                'type': 'input',
-                'start': 3,
-                'count': 8,  # 3-10: sovellustila ... lämmitys-PID
-                'interval': 10,
-                'registers': [
-                    (3, 'app_state', lambda x: x),                            # 3x00004 Sovellustila
-                    (4, None, None),                                          # Skip (3x00005 ei määritelty)
-                    (5, 'fan_actual', lambda x: x),                           # 3x00006 Nykyinen puhaltimen säätö
-                    (6, 'temp/current', lambda x: round(x * 0.1, 1)),         # 3x00007 Huoneen lämpötila
-                    (7, 'temp/setpoint_active', lambda x: round(x * 0.1, 1)), # 3x00008 Nykyinen asetusarvo
-                    (8, 'fan_speed', lambda x: x),                            # 3x00009 Puhaltimen nopeus %
-                    (9, 'cooling_pid', lambda x: x),                          # 3x00010 Jäähdytyksen PID-lähtö %
-                    (10, 'heating_pid', lambda x: x)                          # 3x00011 Lämmityksen PID-lähtö %
-                ]
-            },
-            {
-                'name': 'input_water',
-                'type': 'input',
-                'start': 115,
-                'count': 2,  # 3x00116-117
-                'interval': 30,
-                'registers': [
-                    (115, 'water_in', lambda x: round(x * 0.1, 1)),
-                    (116, 'water_out', lambda x: round(x * 0.1, 1))
-                ]
-            },
-            {
-                'name': 'alarm',
-                'type': 'input',
-                'start': 102,  # 3x00103 Hälytys "Laite 1" (bittikenttä)
-                'count': 1,
-                'interval': 60,
-                'registers': [
-                    (102, 'alarm', lambda x: x)
-                ]
-            }
-        ]
+@dataclass
+class Config:
+    modbus_host: str = ''  # pakollinen
+    modbus_port: int = 502
+    modbus_timeout: float = 5.0
+    slave: int = 1
+    mqtt_host: str = 'localhost'
+    mqtt_port: int = 1883
+    mqtt_user: str = ''
+    mqtt_pass: str = ''
+    topic_prefix: str = 'varipro'
+    discovery_prefix: str = 'homeassistant'
+    min_temp: float = 18.0
+    max_temp: float = 24.0
+    deadzone_max: float = 15.0
+    state_dir: str = ''
+    log_level: str = 'INFO'
 
-        # Hälytysbitit (3x00103) - suomenkieliset nimet
-        self.alarm_bits = [
-            (0,  'kondenssi',          'Kondenssianturin hälytys'),
-            (1,  'puhallin1_rpm',      'Puuttuva kierrosluku, puhallin 1'),
-            (2,  'puhallin2_rpm',      'Puuttuva kierrosluku, puhallin 2'),
-            (3,  'anturi_vesi_sisaan', 'Anturivika, vesi sisään'),
-            (4,  'anturi_vesi_ulos',   'Anturivika, vesi ulos'),
-            (11, 'parametritiedosto',  'Parametritiedosto'),
-            (15, 'suodatin',           'Suodattimen puhdistus')
-        ]
+    @classmethod
+    def from_env(cls, env=None):
+        env = os.environ if env is None else env
 
-        # Modbus client
-        self.modbus = ModbusTcpClient(
-            self.modbus_host,
-            port=self.modbus_port,
-            timeout=5,
-            retries=2,
-            retry_on_empty=True
+        def get(name, default, conv=str):
+            value = env.get(f'VARIPRO_{name}')
+            return default if value in (None, '') else conv(value)
+
+        d = cls()
+        return cls(
+            modbus_host=get('MODBUS_HOST', d.modbus_host),
+            modbus_port=get('MODBUS_PORT', d.modbus_port, int),
+            modbus_timeout=get('MODBUS_TIMEOUT', d.modbus_timeout, float),
+            slave=get('SLAVE', d.slave, int),
+            mqtt_host=get('MQTT_HOST', d.mqtt_host),
+            mqtt_port=get('MQTT_PORT', d.mqtt_port, int),
+            mqtt_user=get('MQTT_USER', d.mqtt_user),
+            mqtt_pass=get('MQTT_PASS', d.mqtt_pass),
+            topic_prefix=get('TOPIC_PREFIX', d.topic_prefix),
+            discovery_prefix=get('DISCOVERY_PREFIX', d.discovery_prefix),
+            min_temp=get('MIN_TEMP', d.min_temp, float),
+            max_temp=get('MAX_TEMP', d.max_temp, float),
+            deadzone_max=get('DEADZONE_MAX', d.deadzone_max, float),
+            # systemd:n StateDirectory= asettaa STATE_DIRECTORY-muuttujan
+            state_dir=(get('STATE_DIR', '') or env.get('STATE_DIRECTORY', '')
+                       or os.path.dirname(os.path.abspath(__file__))),
+            log_level=get('LOG_LEVEL', d.log_level).upper(),
         )
 
-        # MQTT client
-        self.mqtt = mqtt.Client("varipro_optimized")
-        if self.mqtt_user:
-            self.mqtt.username_pw_set(self.mqtt_user, self.mqtt_pass)
-        self.mqtt.on_connect = self.on_mqtt_connect
-        self.mqtt.on_message = self.on_mqtt_message
 
-    # ------------------------------------------------------------------
-    # Mappaukset
-    # ------------------------------------------------------------------
+# ----------------------------------------------------------------------
+# Modbus-väylä
+# ----------------------------------------------------------------------
 
-    def map_mode(self, value):
-        """Muunna sovellustila HA hvac modeksi - off ja cool (fan_only hoidetaan erikseen)"""
-        modes = {1: 'off', 2: 'cool', 3: 'cool'}  # 3 (poissa) on myös cool
-        return modes.get(value, 'off')
+class ModbusBus:
+    """Ohut kääre pymodbus-asiakkaan ympärille: virheet palautetaan None/False-
+    arvoina (ei poikkeuksia), ja kyselyjen väliin jätetään vähintään min_gap
+    sekuntia (manuaali: >= 200 ms). Käytetään vain pääsäikeestä."""
 
-    def determine_preset_from_register(self, mode_register_value):
-        return 'away' if mode_register_value == 3 else 'home'
+    def __init__(self, host, port, device_id, timeout, min_gap=0.2, client=None):
+        if client is None:
+            from pymodbus.client import ModbusTcpClient
+            client = ModbusTcpClient(host, port=port, timeout=timeout, retries=2)
+        self.client = client
+        self.device_id = device_id
+        self.min_gap = min_gap
+        self.last_error = None
+        self._last_request = 0.0
 
-    def get_current_preset(self):
-        """Nykyinen preset. Fan onlyssa palautetaan sentinel, jotta pollaus
-        ei julkaise aktiivista tavoitetta Nonen päälle (debug-topicit
-        target_home/target_away päivittyvät silti normaalisti)."""
-        if self.fan_only_active:
-            return 'fan_only'
-        mode_register = self.cache.get('mode_register_raw', 2)
-        return self.determine_preset_from_register(mode_register)
-
-    def map_fan(self, value):
-        # Lukusuunta: 0 käännetään "off"-tekstiksi jos laite sitä näyttää,
-        # mutta sitä ei tarjota valittavaksi (ks. fan-komentojen käsittely).
-        fans = {0: 'off', 1: 'low', 2: 'medium', 3: 'high', 4: 'auto'}
-        return fans.get(value, 'auto')
-
-    def map_fan_actual_text(self, value):
-        texts = {0: 'Pois', 1: 'Matala', 2: 'Keskitaso', 3: 'Korkea', 4: 'Auto'}
-        return texts.get(value, f'Tuntematon ({value})')
-
-    def map_app_state_text(self, value):
-        texts = {0: 'Alustus', 1: 'Valmiustila', 2: 'Normaali', 3: 'Poissa',
-                 4: 'Huuhtelu', 5: 'Pysähtynyt', 10: 'Testitila'}
-        return texts.get(value, f'Tuntematon ({value})')
-
-    # ------------------------------------------------------------------
-    # Action
-    # ------------------------------------------------------------------
-
-    def determine_action(self):
-        """hvac_action jäähdytys-PID:n ja puhaltimen perusteella."""
-        if not self.fan_only_active and self.cache.get('mode_register_raw', 2) == 1:
-            return 'off'
-        cooling_pid = self.cache.get('cooling_pid_value', 0)
-        fan_speed = self.cache.get('fan_speed_value', 0)
-        if cooling_pid > 0:
-            return 'cooling'
-        elif fan_speed > 4:
-            return 'fan'
-        else:
-            return 'idle'
-
-    def publish_action_if_changed(self):
-        action = self.determine_action()
-        if self.cache.get('current_action') != action:
-            self.mqtt.publish("varipro/action", action, retain=True)
-            self.cache['current_action'] = action
-            self.logger.debug(
-                f"Published action: {action} "
-                f"(pid: {self.cache.get('cooling_pid_value', 0)}%, "
-                f"fan: {self.cache.get('fan_speed_value', 0)}%)"
-            )
-
-    # ------------------------------------------------------------------
-    # Hälytykset
-    # ------------------------------------------------------------------
-
-    def publish_alarm_bits(self, raw_value):
-        for bit, key, _name in self.alarm_bits:
-            state = 'ON' if raw_value & (1 << bit) else 'OFF'
-            cache_key = f'alarm_bit_{key}'
-            if self.cache.get(cache_key) != state:
-                self.mqtt.publish(f"varipro/alarm/{key}", state, retain=True)
-                self.cache[cache_key] = state
-                if state == 'ON':
-                    self.logger.warning(f"Hälytys aktiivinen: {key}")
-
-    # ------------------------------------------------------------------
-    # Kirjoitussuojaus
-    # ------------------------------------------------------------------
-
-    def should_skip_update(self, register_addr, new_value):
-        if register_addr not in self.recent_writes:
-            return False
-        written_value, write_time = self.recent_writes[register_addr]
-        if (datetime.now() - write_time).total_seconds() < 2.0:
-            if new_value == written_value:
-                return True
-        del self.recent_writes[register_addr]
-        return False
-
-    def mark_recent_write(self, register_addr, value):
-        self.recent_writes[register_addr] = (value, datetime.now())
-
-    # ------------------------------------------------------------------
-    # Fan only -tilannekuva
-    # ------------------------------------------------------------------
-
-    def save_fanonly_snapshot(self, snapshot):
+    def _request(self, func, *args, **kwargs):
+        delay = self._last_request + self.min_gap - time.monotonic()
+        if delay > 0:
+            time.sleep(delay)
         try:
-            with open(self.fanonly_file, 'w') as f:
+            result = func(*args, device_id=self.device_id, **kwargs)
+        except Exception as e:
+            self.last_error = str(e) or type(e).__name__
+            self.client.close()  # seuraava kysely avaa yhteyden uudelleen
+            return None
+        finally:
+            self._last_request = time.monotonic()
+        if result is None or result.isError():
+            self.last_error = str(result)
+            return None
+        self.last_error = None
+        return result
+
+    def read(self, kind, start, count):
+        func = (self.client.read_holding_registers if kind == 'holding'
+                else self.client.read_input_registers)
+        result = self._request(func, start, count=count)
+        return None if result is None else list(result.registers)
+
+    def write(self, addr, value):
+        return self._request(self.client.write_register, addr, value) is not None
+
+    def close(self):
+        self.client.close()
+
+
+# ----------------------------------------------------------------------
+# Fan only -tilannekuva
+# ----------------------------------------------------------------------
+
+class FanOnlyStore:
+    """Fan only -tilannekuva levyllä: tila ennen fan onlya, jotta se voidaan
+    palauttaa myös kaatumisen tai uudelleenkäynnistyksen jälkeen."""
+
+    def __init__(self, path):
+        self.path = path
+
+    def save(self, snapshot):
+        tmp = f"{self.path}.tmp"
+        try:
+            with open(tmp, 'w') as f:
                 json.dump(snapshot, f)
-        except Exception as e:
-            self.logger.error(f"Fan only -tilannekuvan tallennus epäonnistui: {e}")
+            os.replace(tmp, self.path)
+        except OSError as e:
+            logger.error(f"Fan only -tilannekuvan tallennus epäonnistui: {e}")
 
-    def load_fanonly_snapshot(self):
+    def load(self):
         try:
-            if os.path.exists(self.fanonly_file):
-                with open(self.fanonly_file) as f:
+            if os.path.exists(self.path):
+                with open(self.path) as f:
                     return json.load(f)
-        except Exception as e:
-            self.logger.error(f"Fan only -tilannekuvan luku epäonnistui: {e}")
+        except (OSError, ValueError) as e:
+            logger.error(f"Fan only -tilannekuvan luku epäonnistui: {e}")
         return None
 
-    def clear_fanonly_snapshot(self):
+    def clear(self):
         try:
-            if os.path.exists(self.fanonly_file):
-                os.remove(self.fanonly_file)
-        except Exception as e:
-            self.logger.error(f"Fan only -tilannekuvan poisto epäonnistui: {e}")
+            if os.path.exists(self.path):
+                os.remove(self.path)
+        except OSError as e:
+            logger.error(f"Fan only -tilannekuvan poisto epäonnistui: {e}")
 
-    def enter_fan_only(self):
-        """Siirry fan only -tilaan: away + kuollut alue 15 °C."""
-        snapshot = {
-            'preset': self.get_current_preset(),
-            'deadzone_raw': self.cache.get('deadzone_raw', 20),
-            'fan': self.cache.get('holding_main_2', 'auto'),
-            'time': datetime.now().isoformat()
-        }
-        self.save_fanonly_snapshot(snapshot)
-        self.fanonly_snapshot = snapshot
 
-        self.modbus.write_register(201, self.FANONLY_DEADZONE_RAW, slave=self.slave)
-        self.mark_recent_write(201, round(self.FANONLY_DEADZONE_RAW * 0.1, 1))
-        self.modbus.write_register(0, 3, slave=self.slave)
-        self.cache['mode_register_raw'] = 3
+@dataclass
+class RegisterGroup:
+    name: str
+    kind: str        # 'holding' tai 'input'
+    start: int
+    count: int
+    interval: float  # s
+    handlers: dict   # {osoite: käsittelijä(raw)}
 
-        # Puhallin manuaalille jos auto/off (auto pysäyttäisi puhaltimen ilman jäähdytystarvetta)
-        if snapshot['fan'] in ('auto', 'off', None):
-            self.modbus.write_register(2, 2, slave=self.slave)
-            self.mark_recent_write(2, 'medium')
-            self.cache['holding_main_2'] = 'medium'
-            self.mqtt.publish("varipro/fan", "medium", retain=True)
 
-        self.fan_only_active = True
-        self.last_fanonly_rewrite = datetime.now()
+# ----------------------------------------------------------------------
+# Silta
+# ----------------------------------------------------------------------
 
-        self.mqtt.publish("varipro/mode", "fan_only", retain=True)
-        self.cache['holding_main_0'] = 'fan_only'
-        self.mqtt.publish("varipro/deadzone",
-                          str(round(self.FANONLY_DEADZONE_RAW * 0.1, 1)), retain=True)
-        # Fan onlyssa ei ole tavoitelämpöä - None piilottaa kortin lämpötilasäätimen
-        self.mqtt.publish("varipro/temp/target", "None", retain=True)
-        self.logger.info(f"Fan only PÄÄLLE (tilannekuva: {snapshot})")
+class VariProBridge:
+    def __init__(self, config, bus=None, mqtt_client=None, clock=time.monotonic):
+        self.cfg = config
+        self.prefix = config.topic_prefix
+        self.clock = clock
 
-    def exit_fan_only(self, write_app_state=True):
-        """Poistu fan only -tilasta ja palauta tilannekuva.
-        write_app_state=False jos tila muuttui jo muualta (paneeli) tai
-        kutsuja kirjoittaa sovellustilan itse (mode/preset-komento)."""
-        snapshot = self.fanonly_snapshot or self.load_fanonly_snapshot() or {}
-        deadzone_raw = snapshot.get('deadzone_raw', 20)
-        preset = snapshot.get('preset', 'home')
+        self.bus = bus or ModbusBus(config.modbus_host, config.modbus_port,
+                                    config.slave, config.modbus_timeout)
+        self.mqtt = mqtt_client or self._make_mqtt_client()
 
-        try:
-            self.modbus.write_register(201, deadzone_raw, slave=self.slave)
-            self.mark_recent_write(201, round(deadzone_raw * 0.1, 1))
-            if write_app_state:
-                reg = 3 if preset == 'away' else 2
-                self.modbus.write_register(0, reg, slave=self.slave)
-                self.cache['mode_register_raw'] = reg
-        except Exception as e:
-            self.logger.error(f"Fan only -palautus epäonnistui: {e}")
+        # Laitteen tila (None = ei vielä luettu)
+        self.mode_raw = None
+        self.fan = None
+        self.target_home = None
+        self.target_away = None
+        self.deadzone_raw = None
+        self.cooling_pid = None
+        self.heating_pid = None
+        self.fan_speed = None
 
+        # Fan only
         self.fan_only_active = False
-        self.fanonly_snapshot = None
-        self.clear_fanonly_snapshot()
+        self.fan_only_snapshot = None
+        self.store = FanOnlyStore(os.path.join(config.state_dir, f'{self.prefix}_fanonly.json'))
+        # (tilannekuva, palautetaanko sovellustila) - laitteelle palauttamatta oleva tila
+        self.pending_restore = None
 
-        # Palauta puhaltimen tila tilannekuvasta (fan only on "kupla":
-        # myös enter-vaiheen medium-pakotus ja käyttäjän fan onlyn aikana
-        # tekemät vaihdot perutaan)
-        orig_fan = snapshot.get('fan')
-        if orig_fan and self.cache.get('holding_main_2') != orig_fan:
-            fans = {'off': 0, 'low': 1, 'medium': 2, 'high': 3, 'auto': 4}
-            try:
-                self.modbus.write_register(2, fans.get(orig_fan, 4), slave=self.slave)
-                self.mark_recent_write(2, orig_fan)
-                self.cache['holding_main_2'] = orig_fan
-                self.mqtt.publish("varipro/fan", orig_fan, retain=True)
-                self.logger.info(f"Puhallin palautettu: {orig_fan}")
-            except Exception as e:
-                self.logger.error(f"Puhaltimen palautus epäonnistui: {e}")
+        self.published = {}       # {alitopic: payload} - julkaistaan vain muutokset
+        self.write_guard = {}     # {rekisteri: (raw, voimassa asti)}
+        self.last_poll = {}
+        self.modbus_failures = 0
+        self.modbus_online = None
 
-        self.cache['current_preset'] = preset
-        self.mqtt.publish("varipro/preset", preset, retain=True)
-        self.mqtt.publish("varipro/deadzone",
-                          str(round(deadzone_raw * 0.1, 1)), retain=True)
-        # Palauta tavoitelämpö kortille (None -> palautetun presetin arvo)
-        target = self.cache.get('holding_main_4' if preset == 'away' else 'holding_main_3')
-        if target is not None:
-            self.mqtt.publish("varipro/temp/target", str(target), retain=True)
-            self.cache['current_target_temp'] = target
-        self.logger.info(f"Fan only POIS (palautettu preset: {preset}, kuollut alue raw: {deadzone_raw})")
-        return preset
+        self.commands = queue.SimpleQueue()  # put() on turvallinen signaalinkäsittelijästä
+        self.stop_event = threading.Event()
 
-    def restore_fanonly_on_startup(self):
-        """Jos edellinen ajo kaatui kesken fan onlyn, palauta normaalitila."""
-        snap = self.load_fanonly_snapshot()
-        if not snap:
+        self.register_groups = [
+            RegisterGroup('holding_main', 'holding', 0, 5, 10, {
+                REG_MODE: self._on_mode,
+                REG_FAN: self._on_fan,
+                REG_TARGET_HOME: self._on_target_home,
+                REG_TARGET_AWAY: self._on_target_away,
+            }),
+            RegisterGroup('holding_deadzone', 'holding', REG_DEADZONE, 1, 60, {
+                REG_DEADZONE: self._on_deadzone,
+            }),
+            RegisterGroup('input_main', 'input', 3, 8, 10, {
+                3: self._on_app_state,                                          # 3x00004 Sovellustila
+                5: self._on_fan_actual,                                         # 3x00006 Puhaltimen säätö
+                6: lambda raw: self.publish('temp/current', scale10(raw)),      # 3x00007 Huonelämpötila
+                7: lambda raw: self.publish('temp/setpoint_active', scale10(raw)),  # 3x00008 Asetusarvo
+                8: self._on_fan_speed,                                          # 3x00009 Puhallin %
+                9: self._on_cooling_pid,                                        # 3x00010 Jäähdytys-PID %
+                10: self._on_heating_pid,                                       # 3x00011 Lämmitys-PID %
+            }),
+            RegisterGroup('input_water', 'input', 115, 2, 30, {
+                115: lambda raw: self.publish('water_in', scale10(raw)),       # 3x00116
+                116: lambda raw: self.publish('water_out', scale10(raw)),      # 3x00117
+            }),
+            RegisterGroup('alarm', 'input', 102, 1, 60, {
+                102: self._on_alarm,                                            # 3x00103 bittikenttä
+            }),
+        ]
+
+    def topic(self, sub):
+        return f"{self.prefix}/{sub}"
+
+    # ------------------------------------------------------------------
+    # MQTT
+    # ------------------------------------------------------------------
+
+    def _make_mqtt_client(self):
+        import paho.mqtt.client as mqtt
+        client = mqtt.Client(mqtt.CallbackAPIVersion.VERSION2, client_id=f"{self.prefix}_bridge")
+        if self.cfg.mqtt_user:
+            client.username_pw_set(self.cfg.mqtt_user, self.cfg.mqtt_pass)
+        client.will_set(self.topic('bridge/status'), 'offline', qos=1, retain=True)
+        client.on_connect = self.on_mqtt_connect
+        client.on_message = self.on_mqtt_message
+        return client
+
+    def publish(self, sub, value, force=False):
+        payload = str(value)
+        if not force and self.published.get(sub) == payload:
             return
-        self.logger.warning("Fan only -tilannekuva löytyi käynnistyksessä - palautetaan normaalitila")
-        try:
-            self.modbus.write_register(201, snap.get('deadzone_raw', 20), slave=self.slave)
-            reg = 3 if snap.get('preset') == 'away' else 2
-            self.modbus.write_register(0, reg, slave=self.slave)
-        except Exception as e:
-            self.logger.error(f"Käynnistyspalautus epäonnistui: {e}")
-        self.clear_fanonly_snapshot()
+        self.mqtt.publish(self.topic(sub), payload, retain=True)
+        self.published[sub] = payload
+
+    def republish_all(self):
+        for sub, payload in list(self.published.items()):
+            self.mqtt.publish(self.topic(sub), payload, retain=True)
+
+    # Callbackit ajetaan pahon säikeessä: ne vain jonottavat työn pääsäikeelle.
+
+    def on_mqtt_connect(self, client, userdata, flags, reason_code, properties=None):
+        if reason_code.is_failure:
+            logger.error(f"MQTT-yhteys hylätty: {reason_code}")
+            return
+        client.subscribe([(self.topic('+/set'), 0), (f"{self.cfg.discovery_prefix}/status", 0)])
+        logger.info("MQTT connected")
+        self.commands.put(('_connected', None))
+
+    def on_mqtt_message(self, client, userdata, msg):
+        payload = msg.payload.decode(errors='replace')
+        if msg.topic == f"{self.cfg.discovery_prefix}/status":
+            if payload == 'online':
+                self.commands.put(('_ha_online', None))
+            return
+        head, tail = f"{self.prefix}/", '/set'
+        if msg.topic.startswith(head) and msg.topic.endswith(tail):
+            self.commands.put((msg.topic[len(head):-len(tail)], payload))
+
+    # ------------------------------------------------------------------
+    # Väylä ja kirjoitussuoja
+    # ------------------------------------------------------------------
+
+    def write(self, addr, raw):
+        if not self.bus.write(addr, raw):
+            logger.error(f"Kirjoitus epäonnistui: rekisteri {addr} = {raw} ({self.bus.last_error})")
+            return False
+        self.write_guard[addr] = (raw, self.clock() + WRITE_GUARD_S)
+        return True
+
+    def guard_blocks(self, addr, raw):
+        """True, jos lukema on todennäköisesti vanha arvo juuri kirjoitetun tilalla."""
+        guard = self.write_guard.get(addr)
+        if guard is None:
+            return False
+        written, until = guard
+        if raw == written or self.clock() >= until:
+            del self.write_guard[addr]
+            return False
+        logger.debug(f"Ohitetaan rekisterin {addr} lukema {raw} (kirjoitettu {written})")
+        return True
+
+    def set_modbus_online(self, online):
+        if online == self.modbus_online:
+            return
+        self.modbus_online = online
+        self.publish('modbus/status', 'online' if online else 'offline', force=True)
+        if online:
+            logger.info("Modbus-yhteys kunnossa")
+        else:
+            logger.warning(f"Modbus-yhteys poikki ({self.bus.last_error})")
 
     # ------------------------------------------------------------------
     # Pollaus
     # ------------------------------------------------------------------
 
-    def should_poll_group(self, group):
-        last = self.last_poll.get(group['name'], datetime.min)
-        return datetime.now() - last >= timedelta(seconds=group['interval'])
+    def poll_due_groups(self):
+        for group in self.register_groups:
+            last = self.last_poll.get(group.name)
+            if last is not None and self.clock() - last < group.interval:
+                continue
+            if not self.read_group(group):
+                break  # väylä ei vastaa - ei jäädä odottamaan jokaisen ryhmän aikakatkaisua
+            self.process_commands()
 
     def read_group(self, group):
-        if not self.should_poll_group(group):
+        registers = self.bus.read(group.kind, group.start, group.count)
+        if registers is None:
+            self.modbus_failures += 1
+            logger.debug(f"Error reading {group.name}: {self.bus.last_error}")
+            if self.modbus_failures >= MODBUS_FAIL_LIMIT:
+                self.set_modbus_online(False)
+            return False
+        self.modbus_failures = 0
+        self.set_modbus_online(True)
+        self.last_poll[group.name] = self.clock()
+
+        for addr, handler in group.handlers.items():
+            raw = registers[addr - group.start]
+            if group.kind == 'holding' and self.guard_blocks(addr, raw):
+                continue
+            handler(raw)
+        self.publish_derived()
+        return True
+
+    def _on_mode(self, raw):
+        self.mode_raw = raw
+        if self.fan_only_active and raw != MODE_AWAY:
+            logger.warning(f"Fan only keskeytetty ulkopuolisella tilamuutoksella (rekisteri 0 = {raw})")
+            self.exit_fan_only(write_mode=False)
+
+    def _on_fan(self, raw):
+        self.fan = RAW_TO_FAN.get(raw, 'auto')
+
+    def _on_target_home(self, raw):
+        self.target_home = scale10(raw)
+        self.publish('temp/target_home', self.target_home)
+
+    def _on_target_away(self, raw):
+        self.target_away = scale10(raw)
+        self.publish('temp/target_away', self.target_away)
+
+    def _on_deadzone(self, raw):
+        if self.published.get('deadzone') != str(scale10(raw)):
+            logger.info(f"Kuollut alue raaka-arvo: {raw} -> {scale10(raw)} °C")
+        # Fan onlyn (tai kesken jääneen palautuksen) 15.0 ei ole "oikea" arvo
+        if not self.fan_only_active and self.pending_restore is None:
+            self.deadzone_raw = raw
+        self.publish('deadzone', scale10(raw))
+
+    def _on_app_state(self, raw):
+        self.publish('app_state', raw)
+        self.publish('app_state_text', APP_STATE_TEXT.get(raw, f'Tuntematon ({raw})'))
+
+    def _on_fan_actual(self, raw):
+        self.publish('fan_actual', raw)
+        self.publish('fan_actual_text', FAN_ACTUAL_TEXT.get(raw, f'Tuntematon ({raw})'))
+
+    def _on_fan_speed(self, raw):
+        self.fan_speed = raw
+        self.publish('fan_speed', raw)
+
+    def _on_cooling_pid(self, raw):
+        self.cooling_pid = raw
+        self.publish('cooling_pid', raw)
+
+    def _on_heating_pid(self, raw):
+        self.heating_pid = raw
+        self.publish('heating_pid', raw)
+
+    def _on_alarm(self, raw):
+        self.publish('alarm', raw)
+        for bit, key, _name in ALARM_BITS:
+            state = 'ON' if raw & (1 << bit) else 'OFF'
+            if state == 'ON' and self.published.get(f'alarm/{key}') != 'ON':
+                logger.warning(f"Hälytys aktiivinen: {key}")
+            self.publish(f'alarm/{key}', state)
+
+    # ------------------------------------------------------------------
+    # Johdetut tilat: mode, preset, aktiivinen tavoite, action
+    # ------------------------------------------------------------------
+
+    @property
+    def preset(self):
+        return 'away' if self.mode_raw == MODE_AWAY else 'home'
+
+    def active_target(self):
+        return self.target_away if self.preset == 'away' else self.target_home
+
+    def determine_action(self):
+        if not self.fan_only_active and self.mode_raw == MODE_OFF:
+            return 'off'
+        if (self.cooling_pid or 0) > 0:
+            return 'cooling'
+        if (self.heating_pid or 0) > 0:
+            return 'heating'
+        if (self.fan_speed or 0) > 4:
+            return 'fan'
+        return 'idle'
+
+    def publish_derived(self):
+        if self.mode_raw is not None:
+            if self.fan_only_active:
+                self.publish('mode', 'fan_only')
+                # Fan onlyssa ei ole tavoitelämpöä - None piilottaa kortin lämpötilasäätimen.
+                # Preset pysyy jäädytettynä fan onlya edeltävään arvoon.
+                self.publish('temp/target', 'None')
+            else:
+                self.publish('mode', MODE_TO_HVAC.get(self.mode_raw, 'off'))
+                self.publish('preset', self.preset)
+                if self.active_target() is not None:
+                    self.publish('temp/target', self.active_target())
+        if self.fan is not None:
+            self.publish('fan', self.fan)
+        if self.cooling_pid is not None:
+            self.publish('action', self.determine_action())
+
+    # ------------------------------------------------------------------
+    # Fan only
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def snapshot_mode(snapshot):
+        mode_raw = snapshot.get('mode_raw')
+        if mode_raw in MODE_TO_HVAC:
+            return mode_raw
+        return MODE_AWAY if snapshot.get('preset') == 'away' else MODE_NORMAL
+
+    def enter_fan_only(self):
+        """Siirry fan only -tilaan: away + kuollut alue 15 °C. Epäonnistuessa
+        perutaan jo tehdyt kirjoitukset, jotta laite ei jää välitilaan."""
+        if self.mode_raw is None or self.pending_restore is not None:
+            logger.warning("Fan only ei mahdollinen nyt (laitteen tila tuntematon tai palautus kesken)")
+            self.republish_rejected('mode')
+            return False
+
+        deadzone_raw = self.deadzone_raw if self.deadzone_raw is not None else DEFAULT_DEADZONE_RAW
+        snapshot = {
+            'preset': self.preset,
+            'mode_raw': self.mode_raw,
+            'deadzone_raw': deadzone_raw,
+            'fan': self.fan or 'auto',
+            'time': datetime.now().isoformat(timespec='seconds'),
+        }
+        self.store.save(snapshot)  # ennen kirjoituksia: kaatuminen kesken on palautettavissa
+
+        if not self.write(REG_DEADZONE, FANONLY_DEADZONE_RAW):
+            self.store.clear()
+            self.republish_rejected('mode')
+            return False
+        if not self.write(REG_MODE, MODE_AWAY):
+            if not self.write(REG_DEADZONE, deadzone_raw):
+                self.pending_restore = (snapshot, False)  # store säilyy: yritetään uudelleen
+            else:
+                self.store.clear()
+            self.republish_rejected('mode')
+            return False
+        self.mode_raw = MODE_AWAY
+
+        # Puhallin manuaalille jos auto/off (auto pysäyttäisi puhaltimen ilman jäähdytystarvetta)
+        if snapshot['fan'] in ('auto', 'off'):
+            if self.write(REG_FAN, FAN_TO_RAW['medium']):
+                self.fan = 'medium'
+
+        self.fan_only_active = True
+        self.fan_only_snapshot = snapshot
+        self.publish('deadzone', scale10(FANONLY_DEADZONE_RAW))
+        self.publish_derived()
+        logger.info(f"Fan only PÄÄLLE (tilannekuva: {snapshot})")
+        return True
+
+    def restore_snapshot(self, snapshot, write_mode):
+        """Kirjoita tilannekuvan arvot laitteelle. True, jos kaikki onnistui.
+        write_mode=True palauttaa myös sovellustilan, mutta vain jos laite on
+        yhä away-tilassa (paneelista tehtyä muutosta ei kumota)."""
+        ok = True
+        deadzone_raw = snapshot.get('deadzone_raw', DEFAULT_DEADZONE_RAW)
+        if self.write(REG_DEADZONE, deadzone_raw):
+            self.deadzone_raw = deadzone_raw
+            self.publish('deadzone', scale10(deadzone_raw))
+        else:
+            ok = False
+
+        if write_mode:
+            regs = self.bus.read('holding', REG_MODE, 1)
+            if regs is None:
+                ok = False
+            elif regs[0] == MODE_AWAY:
+                mode_raw = self.snapshot_mode(snapshot)
+                if mode_raw != MODE_AWAY and not self.write(REG_MODE, mode_raw):
+                    ok = False
+                else:
+                    self.mode_raw = mode_raw
+
+        # Fan only on "kupla": myös enter-vaiheen medium-pakotus ja käyttäjän
+        # fan onlyn aikana tekemät vaihdot perutaan
+        orig_fan = snapshot.get('fan')
+        if orig_fan in FAN_TO_RAW and orig_fan != self.fan:
+            if self.write(REG_FAN, FAN_TO_RAW[orig_fan]):
+                self.fan = orig_fan
+                logger.info(f"Puhallin palautettu: {orig_fan}")
+            else:
+                ok = False
+        return ok
+
+    def exit_fan_only(self, write_mode=True):
+        """Poistu fan only -tilasta ja palauta tilannekuva. Palauttaa fan onlya
+        edeltäneen presetin. write_mode=False jos tila muuttui jo muualta
+        (paneeli) tai kutsuja kirjoittaa sovellustilan itse (mode/preset-komento)."""
+        snapshot = self.fan_only_snapshot or self.store.load() or {}
+        self.fan_only_active = False
+        self.fan_only_snapshot = None
+
+        if self.restore_snapshot(snapshot, write_mode):
+            self.store.clear()
+        else:
+            logger.error("Fan only -palautus jäi kesken - yritetään uudelleen")
+            self.pending_restore = (snapshot, write_mode)
+        logger.info(f"Fan only POIS (preset ennen: {snapshot.get('preset', 'home')}, "
+                    f"kuollut alue raw: {snapshot.get('deadzone_raw')})")
+        return snapshot.get('preset', 'home')
+
+    def retry_pending_restore(self):
+        snapshot, write_mode = self.pending_restore
+        if self.restore_snapshot(snapshot, write_mode):
+            logger.info("Fan only -tilannekuva palautettu laitteelle")
+            self.pending_restore = None
+            self.store.clear()
+            self.publish_derived()
+
+    # ------------------------------------------------------------------
+    # Komennot (pääsäikeessä)
+    # ------------------------------------------------------------------
+
+    def process_commands(self, timeout=0.0):
+        """Käsittele jonossa olevat komennot. timeout > 0 odottaa ensimmäistä."""
+        while True:
+            try:
+                item = self.commands.get(timeout=timeout) if timeout > 0 else self.commands.get_nowait()
+            except queue.Empty:
+                return
+            timeout = 0.0
+            if item is None:  # stop()
+                return
+            cmd, payload = item
+            try:
+                self.handle_command(cmd, payload)
+            except Exception:
+                logger.exception(f"Command error ({cmd})")
+
+    def handle_command(self, cmd, payload):
+        if cmd == '_connected':
+            self.publish_discovery()
+            self.mqtt.publish(self.topic('bridge/status'), 'online', qos=1, retain=True)
+            self.republish_all()
+        elif cmd == '_ha_online':
+            logger.info("Home Assistant käynnistyi - julkaistaan discovery ja tilat uudelleen")
+            self.publish_discovery()
+            self.republish_all()
+        elif cmd == 'mode':
+            self.cmd_mode(payload)
+        elif cmd == 'fan':
+            self.cmd_fan(payload)
+        elif cmd == 'temp':
+            self.cmd_temp(payload)
+        elif cmd == 'preset':
+            self.cmd_preset(payload)
+        elif cmd == 'deadzone':
+            self.cmd_deadzone(payload)
+        else:
+            logger.warning(f"Tuntematon komento: {cmd}")
+
+    def republish_rejected(self, sub):
+        """Hylätty tai epäonnistunut komento: lähetä nykyinen tila uudelleen,
+        jotta HA:n käyttöliittymä palaa todelliseen arvoon."""
+        if sub in self.published:
+            self.publish(sub, self.published[sub], force=True)
+
+    def cmd_mode(self, payload):
+        if payload not in ('off', 'cool', 'fan_only'):
+            logger.warning(f"Tuntematon mode '{payload}' - ohitetaan")
+            self.republish_rejected('mode')
+            return
+        if payload == 'fan_only':
+            if not self.fan_only_active:
+                self.enter_fan_only()
             return
 
+        # cool tai off - poistu ensin fan onlysta jos päällä
+        restored_preset = None
+        if self.fan_only_active:
+            restored_preset = self.exit_fan_only(write_mode=False)
+
+        if payload == 'off':
+            value = MODE_OFF
+        elif restored_preset == 'away' or (restored_preset is None and self.mode_raw == MODE_AWAY):
+            value = MODE_AWAY  # cool pitää away-viilennyksen (myös fan onlysta palatessa)
+        else:
+            value = MODE_NORMAL
+
+        ok = self.write(REG_MODE, value)
+        if ok:
+            self.mode_raw = value
+            logger.debug(f"Set mode to {payload} (register {value})")
+        self.publish_derived()
+        if not ok:
+            self.republish_rejected('mode')
+
+    def cmd_fan(self, payload):
+        # 'off' ei ole valikossa: laite ei pidä fan-rekisterin arvoa 0 (palauttaa
+        # auton), ja se olisi joka tapauksessa sama kuin koko laite off.
+        if payload == 'off' or payload not in FAN_TO_RAW:
+            logger.info(f"Fan '{payload}' ei tuettu - ohitetaan")
+        elif self.fan_only_active and payload == 'auto':
+            logger.info("Fan auto ei ole mielekäs fan only -tilassa - ohitetaan")
+        elif self.write(REG_FAN, FAN_TO_RAW[payload]):
+            self.fan = payload
+            self.publish('fan', payload)
+            logger.debug(f"Set fan to {payload}")
+            return
+        self.republish_rejected('fan')
+
+    def cmd_temp(self, payload):
+        if self.fan_only_active:
+            logger.info("Lämpötilakomento ohitettu fan only -tilassa")
+            self.republish_rejected('temp/target')
+            return
         try:
-            if group['type'] == 'holding':
-                result = self.modbus.read_holding_registers(
-                    group['start'], group['count'], slave=self.slave)
-            else:
-                result = self.modbus.read_input_registers(
-                    group['start'], group['count'], slave=self.slave)
+            value = float(payload)
+        except ValueError:
+            value = None
+        if value is None or not self.cfg.min_temp <= value <= self.cfg.max_temp:
+            logger.warning(f"Tavoitelämpö '{payload}' ei kelpaa "
+                           f"({self.cfg.min_temp}-{self.cfg.max_temp} °C) - ohitetaan")
+            self.republish_rejected('temp/target')
+            return
 
-            if result and not result.isError():
-                preset_changed = False
+        raw = to_raw10(value)
+        away = self.preset == 'away'
+        register = REG_TARGET_AWAY if away else REG_TARGET_HOME
+        if not self.write(register, raw):
+            self.republish_rejected('temp/target')
+            return
+        if away:
+            self.target_away = scale10(raw)
+            self.publish('temp/target_away', self.target_away)
+        else:
+            self.target_home = scale10(raw)
+            self.publish('temp/target_home', self.target_home)
+        self.publish_derived()
+        logger.debug(f"Set temp to {scale10(raw)}°C on register {register} ({self.preset})")
 
-                for i, reg_config in enumerate(group['registers']):
-                    addr, topic, processor = reg_config
+    def cmd_preset(self, payload):
+        # Preset-valinta fan onlyn aikana = poistuminen cool-tilaan
+        if self.fan_only_active:
+            self.exit_fan_only(write_mode=False)
 
-                    if topic is None:
-                        continue
+        # HA lisää preset-valikkoon aina "none"-vaihtoehdon: tulkitaan se homeksi,
+        # ja julkaistaan "home" takaisin, jotta UI ei jää näyttämään "Ei mitään".
+        if payload not in ('home', 'away', 'none'):
+            logger.warning(f"Tuntematon preset '{payload}' - tulkitaan homeksi")
+        value = MODE_AWAY if payload == 'away' else MODE_NORMAL
+        if self.mode_raw == MODE_OFF:
+            logger.warning(f"Preset {payload} requested while device is off - device will turn on")
 
-                    raw_value = result.registers[i]
-                    processed_value = processor(raw_value) if processor else raw_value
+        ok = self.write(REG_MODE, value)
+        if ok:
+            self.mode_raw = value
+            logger.debug(f"Set preset to {self.preset} (requested: {payload})")
+        self.publish_derived()
+        if not ok or payload != self.preset:
+            self.republish_rejected('preset')  # myös "none" -> "home"
 
-                    # Mode-rekisteri: preset-määritys + fan only -valvonta
-                    if addr == 0 and group['name'] == 'holding_main':
-                        self.cache['mode_register_raw'] = raw_value
-
-                        if self.fan_only_active:
-                            if raw_value != 3:
-                                # Joku muutti tilaa muualta (esim. paneelista)
-                                self.logger.warning(
-                                    "Fan only keskeytetty ulkopuolisella tilamuutoksella "
-                                    f"(rekisteri 0 = {raw_value})")
-                                self.exit_fan_only(write_app_state=False)
-                                # processed_value pysyy map_moden mukaisena
-                            else:
-                                # Fan only voimassa: mode pysyy fan_only, preset jäädytetty
-                                processed_value = 'fan_only'
-
-                        if not self.fan_only_active:
-                            old_preset = self.cache.get('current_preset', 'home')
-                            new_preset = self.determine_preset_from_register(raw_value)
-                            if old_preset != new_preset:
-                                self.mqtt.publish("varipro/preset", new_preset, retain=True)
-                                self.cache['current_preset'] = new_preset
-                                self.logger.debug(f"Updated preset to: {new_preset} (mode register: {raw_value})")
-                                preset_changed = True
-
-                    # --- Target temp -erikoiskäsittelyt ---
-                    if topic == 'temp/target':
-                        current_preset = self.get_current_preset()
-                        cache_key = f"{group['name']}_{addr}"
-                        if self.cache.get(cache_key) != processed_value:
-                            self.mqtt.publish("varipro/temp/target_home", str(processed_value), retain=True)
-                        self.cache[cache_key] = processed_value
-                        if current_preset == 'home':
-                            if not self.should_skip_update(addr, processed_value):
-                                self.mqtt.publish("varipro/temp/target", str(processed_value), retain=True)
-                                self.cache['current_target_temp'] = processed_value
-                        continue
-
-                    elif topic == 'temp/target_away':
-                        current_preset = self.get_current_preset()
-                        cache_key = f"{group['name']}_{addr}"
-                        if self.cache.get(cache_key) != processed_value:
-                            self.mqtt.publish("varipro/temp/target_away", str(processed_value), retain=True)
-                        self.cache[cache_key] = processed_value
-                        if current_preset == 'away':
-                            if not self.should_skip_update(addr, processed_value):
-                                self.mqtt.publish("varipro/temp/target", str(processed_value), retain=True)
-                                self.cache['current_target_temp'] = processed_value
-                        continue
-
-                    # --- Kuollut alue ---
-                    if topic == 'deadzone':
-                        if self.cache.get('deadzone_raw') != raw_value:
-                            self.logger.info(f"Kuollut alue raaka-arvo: {raw_value} -> {processed_value} °C")
-                        # Fan onlyn aikana emme tallenna 15.0-arvoa "oikeaksi" arvoksi
-                        if not self.fan_only_active:
-                            self.cache['deadzone_raw'] = raw_value
-
-                    # --- Tekstisensorit ---
-                    if topic == 'app_state':
-                        text = self.map_app_state_text(raw_value)
-                        if self.cache.get('app_state_text') != text:
-                            self.mqtt.publish("varipro/app_state_text", text, retain=True)
-                            self.cache['app_state_text'] = text
-
-                    if topic == 'fan_actual':
-                        text = self.map_fan_actual_text(raw_value)
-                        if self.cache.get('fan_actual_text') != text:
-                            self.mqtt.publish("varipro/fan_actual_text", text, retain=True)
-                            self.cache['fan_actual_text'] = text
-
-                    # --- Action-laskennan lähtöarvot ---
-                    if topic == 'cooling_pid':
-                        self.cache['cooling_pid_value'] = processed_value
-                    if topic == 'fan_speed':
-                        self.cache['fan_speed_value'] = processed_value
-                    if topic == 'temp/current':
-                        self.cache['current_room_temp'] = processed_value
-
-                    # --- Hälytysbittien purku ---
-                    if topic == 'alarm':
-                        self.publish_alarm_bits(raw_value)
-
-                    if self.should_skip_update(addr, processed_value):
-                        self.logger.debug(f"Skipping {topic} update (recently written same value)")
-                        continue
-
-                    cache_key = f"{group['name']}_{addr}"
-                    if self.cache.get(cache_key) != processed_value:
-                        self.mqtt.publish(f"varipro/{topic}", str(processed_value), retain=True)
-                        self.cache[cache_key] = processed_value
-                        self.logger.debug(f"Published {topic}: {processed_value}")
-
-                if group['name'] == 'input_main':
-                    self.publish_action_if_changed()
-
-                if preset_changed:
-                    current_preset = self.get_current_preset()
-                    if current_preset == 'away':
-                        away_temp = self.cache.get('holding_main_4')
-                        if away_temp is not None:
-                            self.mqtt.publish("varipro/temp/target", str(away_temp), retain=True)
-                            self.cache['current_target_temp'] = away_temp
-                    else:
-                        home_temp = self.cache.get('holding_main_3')
-                        if home_temp is not None:
-                            self.mqtt.publish("varipro/temp/target", str(home_temp), retain=True)
-                            self.cache['current_target_temp'] = home_temp
-
-                self.last_poll[group['name']] = datetime.now()
-
-        except Exception as e:
-            self.logger.error(f"Error reading {group['name']}: {e}")
+    def cmd_deadzone(self, payload):
+        if self.fan_only_active:
+            # Kuollut alue on fan onlyn käytössä - älä anna sotkea
+            logger.info("Kuollut alue -komento ohitettu fan only -tilassa")
+            self.republish_rejected('deadzone')
+            return
+        try:
+            value = float(payload)
+        except ValueError:
+            value = None
+        if value is None or not 0 <= value <= self.cfg.deadzone_max:
+            logger.warning(f"Kuollut alue '{payload}' ei kelpaa (0-{self.cfg.deadzone_max} °C) - ohitetaan")
+        else:
+            raw = to_raw10(value)
+            if self.write(REG_DEADZONE, raw):
+                self.deadzone_raw = raw
+                self.publish('deadzone', scale10(raw))
+                logger.info(f"Set deadzone to {scale10(raw)}°C (register {REG_DEADZONE} = {raw})")
+                return
+        self.republish_rejected('deadzone')
 
     # ------------------------------------------------------------------
     # Discovery
     # ------------------------------------------------------------------
 
-    def publish_discovery(self):
+    def uid(self, name):
+        return f"{self.prefix}_{name}"
+
+    def discovery_configs(self):
+        """[(config-topic, payload)]. unique_id:t ja oletustopicit ovat samat kuin
+        v1:ssä, joten HA:n entiteetit (ja historia) säilyvät päivityksessä."""
+        disc = self.cfg.discovery_prefix
         device = {
-            "identifiers": ["varipro_001"],
+            "identifiers": ["varipro_001" if self.prefix == 'varipro' else self.prefix],
             "name": "VariPro Chiller",
             "model": "Room Controller",
             "manufacturer": "Chiller",
-            "via_device": "Modbus Bridge"
         }
+        origin = {"name": "varipro-modbus-mqtt", "sw_version": __version__, "support_url": REPO_URL}
+        availability = {
+            "availability": [{"topic": self.topic('bridge/status')},
+                             {"topic": self.topic('modbus/status')}],
+            "availability_mode": "all",
+        }
+        common = {"device": device, "origin": origin, **availability}
+        configs = []
 
         climate = {
             "name": "Ilmastointi",
-            "unique_id": "varipro_chiller",
-            "device": device,
-            "current_temperature_topic": "varipro/temp/current",
-            "temperature_state_topic": "varipro/temp/target",
-            "temperature_command_topic": "varipro/temp/set",
-            "mode_state_topic": "varipro/mode",
-            "mode_command_topic": "varipro/mode/set",
+            "unique_id": "varipro_chiller" if self.prefix == 'varipro' else self.uid('chiller'),
+            **common,
+            "current_temperature_topic": self.topic('temp/current'),
+            "temperature_state_topic": self.topic('temp/target'),
+            "temperature_command_topic": self.topic('temp/set'),
+            "mode_state_topic": self.topic('mode'),
+            "mode_command_topic": self.topic('mode/set'),
             "modes": ["off", "cool", "fan_only"],
-            "action_topic": "varipro/action",
-            "fan_mode_state_topic": "varipro/fan",
-            "fan_mode_command_topic": "varipro/fan/set",
+            "action_topic": self.topic('action'),
+            "fan_mode_state_topic": self.topic('fan'),
+            "fan_mode_command_topic": self.topic('fan/set'),
             "fan_modes": ["auto", "low", "medium", "high"],
-            "preset_mode_state_topic": "varipro/preset",
-            "preset_mode_command_topic": "varipro/preset/set",
+            "preset_mode_state_topic": self.topic('preset'),
+            "preset_mode_command_topic": self.topic('preset/set'),
             "preset_modes": ["home", "away"],
             "temp_step": 0.5,
-            "min_temp": 18,
-            "max_temp": 24,
-            "availability": [
-                {
-                    "topic": "varipro/bridge/status",
-                    "payload_available": "online",
-                    "payload_not_available": "offline"
-                }
-            ]
+            "min_temp": self.cfg.min_temp,
+            "max_temp": self.cfg.max_temp,
         }
-        self.mqtt.publish("homeassistant/climate/varipro/config",
-                          json.dumps(climate), retain=True, qos=1)
+        configs.append((f"{disc}/climate/{self.prefix}/config", climate))
 
-        # (topic, nimi, yksikkö, device_class)
+        # (topic, nimi, yksikkö, device_class, diagnostiikka)
         sensors = [
-            ("fan_speed", "Puhaltimen nopeus", "%", None),
-            ("cooling_pid", "Jäähdytysteho (PID)", "%", None),
-            ("heating_pid", "Lämmitysteho (PID)", "%", None),
-            ("water_in", "Tuloveden lämpötila", "°C", "temperature"),
-            ("water_out", "Poistoveden lämpötila", "°C", "temperature"),
-            ("temp/current", "Huonelämpötila", "°C", "temperature"),
-            ("temp/setpoint_active", "Aktiivinen asetusarvo (laite)", "°C", "temperature"),
-            ("temp/target_home", "Tavoitelämpötila, kotona", "°C", "temperature"),
-            ("temp/target_away", "Tavoitelämpötila, poissa", "°C", "temperature"),
-            ("app_state_text", "Sovellustila", None, None),
-            ("fan_actual_text", "Puhaltimen tila (toteutunut)", None, None),
-            ("alarm", "Hälytys (raaka)", None, None)
+            ("temp/current", "Huonelämpötila", "°C", "temperature", False),
+            ("fan_speed", "Puhaltimen nopeus", "%", None, True),
+            ("cooling_pid", "Jäähdytysteho (PID)", "%", None, True),
+            ("heating_pid", "Lämmitysteho (PID)", "%", None, True),
+            ("water_in", "Tuloveden lämpötila", "°C", "temperature", True),
+            ("water_out", "Poistoveden lämpötila", "°C", "temperature", True),
+            ("temp/setpoint_active", "Aktiivinen asetusarvo (laite)", "°C", "temperature", True),
+            ("temp/target_home", "Tavoitelämpötila, kotona", "°C", "temperature", True),
+            ("temp/target_away", "Tavoitelämpötila, poissa", "°C", "temperature", True),
+            ("app_state_text", "Sovellustila", None, None, True),
+            ("fan_actual_text", "Puhaltimen tila (toteutunut)", None, None, True),
+            ("alarm", "Hälytys (raaka)", None, None, True),
         ]
-        for topic, name, unit, dev_class in sensors:
-            uid = f"varipro_{topic.replace('/', '_')}"
-            config = {
-                "name": f"VariPro {name}",
-                "unique_id": uid,
-                "state_topic": f"varipro/{topic}",
-                "device": device
-            }
+        for topic, name, unit, dev_class, diagnostic in sensors:
+            uid = self.uid(topic.replace('/', '_'))
+            config = {"name": name, "unique_id": uid, "state_topic": self.topic(topic), **common}
             if unit:
                 config["unit_of_measurement"] = unit
                 config["state_class"] = "measurement"  # HA:n pitkäaikaistilastot
             if dev_class:
                 config["device_class"] = dev_class
-            self.mqtt.publish(f"homeassistant/sensor/{uid}/config",
-                              json.dumps(config), retain=True, qos=1)
+            if diagnostic:
+                config["entity_category"] = "diagnostic"
+            configs.append((f"{disc}/sensor/{uid}/config", config))
 
-        for _bit, key, name in self.alarm_bits:
-            uid = f"varipro_halytys_{key}"
-            config = {
-                "name": f"VariPro {name}",
+        for _bit, key, name in ALARM_BITS:
+            uid = self.uid(f"halytys_{key}")
+            configs.append((f"{disc}/binary_sensor/{uid}/config", {
+                "name": name,
                 "unique_id": uid,
-                "state_topic": f"varipro/alarm/{key}",
+                "state_topic": self.topic(f'alarm/{key}'),
                 "payload_on": "ON",
                 "payload_off": "OFF",
                 "device_class": "problem",
-                "device": device
-            }
-            self.mqtt.publish(f"homeassistant/binary_sensor/{uid}/config",
-                              json.dumps(config), retain=True, qos=1)
+                **common,
+            }))
 
-        deadzone = {
-            "name": "VariPro Poissa-tilan kuollut alue",
-            "unique_id": "varipro_deadzone",
-            "state_topic": "varipro/deadzone",
-            "command_topic": "varipro/deadzone/set",
+        configs.append((f"{disc}/number/{self.uid('deadzone')}/config", {
+            "name": "Poissa-tilan kuollut alue",
+            "unique_id": self.uid('deadzone'),
+            "state_topic": self.topic('deadzone'),
+            "command_topic": self.topic('deadzone/set'),
             "min": 0,
-            "max": 15,
+            "max": self.cfg.deadzone_max,
             "step": 0.5,
             "unit_of_measurement": "°C",
             "icon": "mdi:thermometer-lines",
-            "device": device
-        }
-        self.mqtt.publish("homeassistant/number/varipro_deadzone/config",
-                          json.dumps(deadzone), retain=True, qos=1)
+            "entity_category": "config",
+            **common,
+        }))
+        return configs
 
-        self.mqtt.publish("varipro/bridge/status", "online", retain=True)
+    def publish_discovery(self):
+        for topic, config in self.discovery_configs():
+            self.mqtt.publish(topic, json.dumps(config), retain=True, qos=1)
 
     # ------------------------------------------------------------------
     # Pääsilmukka
     # ------------------------------------------------------------------
 
-    def start(self):
-        self.mqtt.connect(self.mqtt_host, self.mqtt_port)
+    def stop(self, *_args):
+        self.stop_event.set()
+        self.commands.put(None)
+
+    def run(self):
+        logger.info(f"VariPro-silta {__version__}: Modbus {self.cfg.modbus_host}:{self.cfg.modbus_port}, "
+                    f"MQTT {self.cfg.mqtt_host}:{self.cfg.mqtt_port}")
+        self.mqtt.connect_async(self.cfg.mqtt_host, self.cfg.mqtt_port)
         self.mqtt.loop_start()
 
-        if not self.modbus.connect():
-            self.logger.error("Modbus connection failed!")
-            return
+        # Jos edellinen ajo päättyi kesken fan onlyn, palautetaan normaalitila
+        snapshot = self.store.load()
+        if snapshot:
+            logger.warning("Fan only -tilannekuva löytyi käynnistyksessä - palautetaan normaalitila")
+            self.pending_restore = (snapshot, True)
 
-        # Palauta normaalitila, jos edellinen ajo kaatui kesken fan onlyn
-        self.restore_fanonly_on_startup()
+        try:
+            while not self.stop_event.is_set():
+                try:
+                    self.process_commands()
+                    self.poll_due_groups()
+                    # Vasta kun väylä on vastannut: katkoksen aikana ei yritetä joka sekunti
+                    if self.pending_restore is not None and self.modbus_online:
+                        self.retry_pending_restore()
+                    self.process_commands(timeout=1.0)
+                except Exception:
+                    logger.exception("Main loop error")
+                    self.stop_event.wait(5)
+        finally:
+            self.shutdown()
 
-        self.publish_discovery()
-
-        while True:
-            try:
-                for group in self.register_groups:
-                    self.read_group(group)
-                    time.sleep(self.min_poll_delay)
-
-                # Fan only -vahtikoira: kirjoita tila uudelleen 5 min välein
-                # (manuaali suosittelee rekisterien päivityskirjoitusta muutenkin)
-                if self.fan_only_active and \
-                   (datetime.now() - self.last_fanonly_rewrite).total_seconds() > 300:
-                    try:
-                        self.modbus.write_register(0, 3, slave=self.slave)
-                        self.modbus.write_register(201, self.FANONLY_DEADZONE_RAW, slave=self.slave)
-                        self.last_fanonly_rewrite = datetime.now()
-                        self.logger.debug("Fan only -vahtikoira: tila kirjoitettu uudelleen")
-                    except Exception as e:
-                        self.logger.error(f"Fan only -vahtikoira epäonnistui: {e}")
-
-                time.sleep(1)
-            except KeyboardInterrupt:
-                break
-            except Exception as e:
-                self.logger.error(f"Main loop error: {e}")
-                time.sleep(5)
-
+    def shutdown(self):
         # Siisti lopetus: jos fan only päällä, palauta normaalitila
         if self.fan_only_active:
-            self.exit_fan_only(write_app_state=True)
-
-        self.mqtt.publish("varipro/bridge/status", "offline", retain=True)
-        self.mqtt.disconnect()
-        self.modbus.close()
-
-    # ------------------------------------------------------------------
-    # MQTT-komennot
-    # ------------------------------------------------------------------
-
-    def on_mqtt_connect(self, client, userdata, flags, rc):
-        client.subscribe("varipro/+/set")
-        self.logger.info("MQTT connected")
-
-    def on_mqtt_message(self, client, userdata, msg):
+            try:
+                self.exit_fan_only(write_mode=True)
+            except Exception:
+                logger.exception("Fan only -palautus lopetuksessa epäonnistui")
+        info = self.mqtt.publish(self.topic('bridge/status'), 'offline', qos=1, retain=True)
         try:
-            topic = msg.topic.replace("varipro/", "").replace("/set", "")
-            payload = msg.payload.decode()
+            info.wait_for_publish(timeout=2)
+        except Exception:
+            pass
+        self.mqtt.disconnect()
+        self.mqtt.loop_stop()
+        self.bus.close()
+        logger.info("Silta pysäytetty")
 
-            if topic in ("mode", "fan"):
-                self.mqtt.publish(f"varipro/{topic}", payload, retain=True)
 
-            time.sleep(0.3)
-
-            if topic == "mode":
-                if payload == 'fan_only':
-                    if not self.fan_only_active:
-                        self.enter_fan_only()
-                    return
-
-                # cool tai off - poistu ensin fan onlysta jos päällä
-                restored_preset = None
-                if self.fan_only_active:
-                    restored_preset = self.exit_fan_only(write_app_state=False)
-
-                if payload == 'off':
-                    value = 1
-                elif payload == 'cool' and restored_preset == 'away':
-                    value = 3  # palataan away-viilennykseen josta fan only aloitettiin
-                else:
-                    value = 2
-
-                self.modbus.write_register(0, value, slave=self.slave)
-                self.mark_recent_write(0, payload)
-                self.cache['holding_main_0'] = payload
-                self.cache['mode_register_raw'] = value
-                self.logger.debug(f"Set mode to {payload} (register {value})")
-
-            elif topic == "fan":
-                # 'off' poistettu fan-valikosta: laite ei pidä fan-rekisterin
-                # arvoa 0 (palauttaa auton), ja se olisi joka tapauksessa sama
-                # kuin koko laite off. Ohitetaan varmuuden vuoksi jos joku
-                # lähettää sen (esim. vanha retained-viesti).
-                if payload == 'off':
-                    self.logger.info("Fan 'off' ei tuettu - ohitetaan (käytä mode off)")
-                    current = self.cache.get('holding_main_2', 'auto')
-                    self.mqtt.publish("varipro/fan", str(current), retain=True)
-                    return
-                fans = {'low': 1, 'medium': 2, 'high': 3, 'auto': 4}
-                value = fans.get(payload, 4)
-                if self.fan_only_active and payload == 'auto':
-                    self.logger.info("Fan auto ei ole mielekäs fan only -tilassa - ohitetaan")
-                    current = self.cache.get('holding_main_2', 'medium')
-                    self.mqtt.publish("varipro/fan", str(current), retain=True)
-                    return
-                self.modbus.write_register(2, value, slave=self.slave)
-                self.mark_recent_write(2, payload)
-                self.cache['holding_main_2'] = payload
-                self.logger.debug(f"Set fan to {payload} (register {value})")
-
-            elif topic == "temp":
-                if self.fan_only_active:
-                    # Fan onlyssa ei ole tavoitetta - pidä None voimassa
-                    self.logger.info("Lämpötilakomento ohitettu fan only -tilassa")
-                    self.mqtt.publish("varipro/temp/target", "None", retain=True)
-                    return
-
-                current_preset = self.get_current_preset()
-                register = 4 if current_preset == 'away' else 3
-                value = int(float(payload) * 10)
-                self.modbus.write_register(register, value, slave=self.slave)
-                self.mark_recent_write(register, float(payload))
-                self.cache[f"holding_main_{register}"] = float(payload)
-                self.cache['current_target_temp'] = float(payload)
-                self.mqtt.publish("varipro/temp/target", payload, retain=True)
-                if current_preset == 'away':
-                    self.mqtt.publish("varipro/temp/target_away", payload, retain=True)
-                else:
-                    self.mqtt.publish("varipro/temp/target_home", payload, retain=True)
-                self.logger.debug(f"Set temp to {payload}°C on register {register} ({current_preset})")
-
-            elif topic == "preset":
-                # Preset-valinta fan onlyn aikana = poistuminen cool-tilaan
-                if self.fan_only_active:
-                    self.exit_fan_only(write_app_state=False)
-                    self.mqtt.publish("varipro/mode", "cool", retain=True)
-                    self.cache['holding_main_0'] = 'cool'
-
-                # HA lisää preset-valikkoon aina automaattisesti "none"-vaihtoehdon.
-                # Tulkitaan se samaksi kuin home, ja julkaistaan "home" takaisin
-                # jotta UI ei jää näyttämään "Ei mitään".
-                if payload == 'away':
-                    effective_preset = 'away'
-                    mode_register_value = 3
-                else:  # home, none tai muu
-                    effective_preset = 'home'
-                    mode_register_value = 2
-
-                if self.cache.get('mode_register_raw', 2) == 1:
-                    self.logger.warning(f"Preset {effective_preset} requested while device is off - device will turn on")
-
-                self.modbus.write_register(0, mode_register_value, slave=self.slave)
-
-                current_ha_mode = self.cache.get('holding_main_0', 'cool')
-                self.mark_recent_write(0, current_ha_mode)
-                self.cache['mode_register_raw'] = mode_register_value
-                self.cache['current_preset'] = effective_preset
-                self.mqtt.publish("varipro/preset", effective_preset, retain=True)
-
-                if effective_preset == 'away':
-                    away_temp = self.cache.get('holding_main_4')
-                    if away_temp is not None:
-                        self.mqtt.publish("varipro/temp/target", str(away_temp), retain=True)
-                        self.cache['current_target_temp'] = away_temp
-                else:
-                    home_temp = self.cache.get('holding_main_3')
-                    if home_temp is not None:
-                        self.mqtt.publish("varipro/temp/target", str(home_temp), retain=True)
-                        self.cache['current_target_temp'] = home_temp
-
-                self.logger.debug(f"Set preset to {effective_preset} (requested: {payload}), mode register to {mode_register_value}")
-
-            elif topic == "deadzone":
-                if self.fan_only_active:
-                    # Kuollut alue on fan onlyn käytössä - älä anna sotkea
-                    self.logger.info("Kuollut alue -komento ohitettu fan only -tilassa")
-                    self.mqtt.publish("varipro/deadzone",
-                                      str(round(self.FANONLY_DEADZONE_RAW * 0.1, 1)), retain=True)
-                    return
-                value = int(float(payload) * 10)
-                self.modbus.write_register(201, value, slave=self.slave)
-                self.mark_recent_write(201, float(payload))
-                self.cache['deadzone_raw'] = value
-                self.mqtt.publish("varipro/deadzone", payload, retain=True)
-                self.logger.info(f"Set deadzone to {payload}°C (register 201 = {value})")
-
-        except Exception as e:
-            self.logger.error(f"Command error: {e}")
+def main():
+    config = Config.from_env()
+    if not config.modbus_host:
+        raise SystemExit("VARIPRO_MODBUS_HOST puuttuu (Modbus TCP -yhdyskäytävän osoite)")
+    logging.basicConfig(
+        level=getattr(logging, config.log_level, logging.INFO),
+        format='%(asctime)s - %(levelname)s - %(message)s'
+    )
+    bridge = VariProBridge(config)
+    signal.signal(signal.SIGTERM, bridge.stop)
+    signal.signal(signal.SIGINT, bridge.stop)
+    bridge.run()
 
 
 if __name__ == "__main__":
-    logging.basicConfig(
-        level=logging.INFO,
-        format='%(asctime)s - %(levelname)s - %(message)s'
-    )
-
-    bridge = OptimizedVariProBridge()
-    bridge.start()
+    main()

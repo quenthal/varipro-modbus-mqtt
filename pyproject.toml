@@ -1,0 +1,42 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "varipro-modbus-mqtt"
+dynamic = ["version"]
+description = "Chiller VariPro -huonesäädin Home Assistantiin Modbus TCP:n ja MQTT-discoveryn kautta"
+readme = "README.md"
+license = { text = "MIT" }
+requires-python = ">=3.10"
+dependencies = [
+    "pymodbus>=3.10,<4",
+    "paho-mqtt>=2.0,<3",
+]
+
+[project.optional-dependencies]
+dev = ["pytest", "ruff"]
+
+[project.scripts]
+varipro-bridge = "varipro_bridge:main"
+
+[project.urls]
+Homepage = "https://github.com/quenthal/varipro-modbus-mqtt"
+
+[tool.setuptools]
+py-modules = ["varipro_bridge"]
+
+[tool.setuptools.dynamic]
+version = { attr = "varipro_bridge.__version__" }
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]
+
+[tool.ruff]
+line-length = 120
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "B", "I", "UP"]
+ignore = ["E241", "UP031"]
