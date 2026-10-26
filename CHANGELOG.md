@@ -43,3 +43,5 @@ päivitysohje: README → "Päivitys versiosta 1.x".
   ja `VARIPRO_MQTT_HOST`:n oletus on `localhost`.
 - Kyselyjen väli (≥ 200 ms) koskee nyt myös kirjoituksia.
 - `cool`-valinta away-tilassa pitää away-presetin (aiemmin vaihtui homeksi).
+- Fan onlyn 5 minuutin uudelleenkirjoitus poistettu: muuttumattomien arvojen
+  kirjoittaminen on turhaa, ja muuttuneet arvot ovat käyttäjän paneelivalintoja.

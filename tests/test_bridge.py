@@ -322,15 +322,19 @@ def test_fan_only_rolls_back_on_partial_failure(env):
     assert mqtt.last('varipro/mode') == 'cool'
 
 
-def test_fan_only_watchdog_rewrites(env):
+def test_fan_only_no_periodic_writes(env):
+    """Muuttumattomia arvoja ei kirjoiteta uudelleen, eikä paneelista tehtyä muutosta kumota."""
     bridge, bus, mqtt, clock = env
     poll_all(bridge, clock)
     cmd(bridge, 'mode', 'fan_only')
     bus.writes.clear()
-    clock.now += vb.FANONLY_REWRITE_S
-    bridge.fan_only_watchdog()
-    assert (vb.REG_MODE, vb.MODE_AWAY) in bus.writes
-    assert (vb.REG_DEADZONE, vb.FANONLY_DEADZONE_RAW) in bus.writes
+    bus.holding[2] = vb.FAN_TO_RAW['high']  # käyttäjä vaihtoi nopeuden paneelista
+    for _ in range(10):
+        clock.now += 60
+        poll_all(bridge, clock)
+    assert bus.writes == []
+    assert bridge.fan_only_active
+    assert mqtt.last('varipro/fan') == 'high'
 
 
 def test_shutdown_restores_fan_only(env):

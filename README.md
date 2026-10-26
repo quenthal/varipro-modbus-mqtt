@@ -164,7 +164,7 @@ ovat 0-pohjaisia (pymodbus), eli esim. "4x00001" = osoite 0.
 |---|---|
 | Kyselyjen väli ≥ 200 ms | Väh. 200 ms jokaisen kyselyn ja kirjoituksen välissä |
 | Vastauksen aikakatkaisu 2000 ms | Odottaa vastausta 5 s (`VARIPRO_MODBUS_TIMEOUT`) |
-| Kirjoita (päivitä) halutut rekisterit vähintään 5 min välein | Fan only -tila kirjoitetaan uudelleen 5 min välein. Muita arvoja ei päivitetä jaksollisesti: laite on pitänyt ne käytännössä kuukausia ilman päivitystä. Käyttäjän komennot kirjoitetaan heti |
+| Kirjoita (päivitä) halutut rekisterit vähintään 5 min välein | Ei jaksollisia kirjoituksia: laite on pitänyt arvot käytännössä kuukausia ilman päivitystä, ja uudelleenkirjoitus kumoaisi paneelista tehdyt muutokset. Käyttäjän komennot kirjoitetaan heti |
 
 ## MQTT-topicit
 

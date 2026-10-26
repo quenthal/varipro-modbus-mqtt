@@ -66,7 +66,6 @@ ALARM_BITS = [
 
 FANONLY_DEADZONE_RAW = 150   # 15.0 °C
 DEFAULT_DEADZONE_RAW = 20    # 2.0 °C, jos oikeaa arvoa ei ole vielä luettu
-FANONLY_REWRITE_S = 300      # fan only -tilan uudelleenkirjoitus (manuaali: päivitä rekisterit väh. 5 min välein)
 WRITE_GUARD_S = 15           # näin kauan kirjoituksen jälkeen eroava lukema tulkitaan vanhaksi
 MODBUS_FAIL_LIMIT = 3        # peräkkäiset lukuvirheet ennen kuin Modbus merkitään offline-tilaan
 
@@ -257,7 +256,6 @@ class VariProBridge:
         # Fan only
         self.fan_only_active = False
         self.fan_only_snapshot = None
-        self.last_fanonly_rewrite = 0.0
         self.store = FanOnlyStore(os.path.join(config.state_dir, f'{self.prefix}_fanonly.json'))
         # (tilannekuva, palautetaanko sovellustila) - laitteelle palauttamatta oleva tila
         self.pending_restore = None
@@ -554,7 +552,6 @@ class VariProBridge:
 
         self.fan_only_active = True
         self.fan_only_snapshot = snapshot
-        self.last_fanonly_rewrite = self.clock()
         self.publish('deadzone', scale10(FANONLY_DEADZONE_RAW))
         self.publish_derived()
         logger.info(f"Fan only PÄÄLLE (tilannekuva: {snapshot})")
@@ -618,15 +615,6 @@ class VariProBridge:
             self.pending_restore = None
             self.store.clear()
             self.publish_derived()
-
-    def fan_only_watchdog(self):
-        """Kirjoita fan only -tila uudelleen 5 min välein (manuaali suosittelee
-        jaksollista päivityskirjoitusta)."""
-        if self.fan_only_active and self.clock() - self.last_fanonly_rewrite >= FANONLY_REWRITE_S:
-            self.write(REG_MODE, MODE_AWAY)
-            self.write(REG_DEADZONE, FANONLY_DEADZONE_RAW)
-            self.last_fanonly_rewrite = self.clock()
-            logger.debug("Fan only -vahtikoira: tila kirjoitettu uudelleen")
 
     # ------------------------------------------------------------------
     # Komennot (pääsäikeessä)
@@ -927,7 +915,6 @@ class VariProBridge:
                     # Vasta kun väylä on vastannut: katkoksen aikana ei yritetä joka sekunti
                     if self.pending_restore is not None and self.modbus_online:
                         self.retry_pending_restore()
-                    self.fan_only_watchdog()
                     self.process_commands(timeout=1.0)
                 except Exception:
                     logger.exception("Main loop error")
