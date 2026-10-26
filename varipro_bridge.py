@@ -66,7 +66,7 @@ ALARM_BITS = [
 
 FANONLY_DEADZONE_RAW = 150   # 15.0 °C
 DEFAULT_DEADZONE_RAW = 20    # 2.0 °C, jos oikeaa arvoa ei ole vielä luettu
-FANONLY_REWRITE_S = 300      # fan only -tilan uudelleenkirjoitus (manuaali: jaksolliset kirjoitukset >= 5 min)
+FANONLY_REWRITE_S = 300      # fan only -tilan uudelleenkirjoitus (manuaali: päivitä rekisterit väh. 5 min välein)
 WRITE_GUARD_S = 15           # näin kauan kirjoituksen jälkeen eroava lukema tulkitaan vanhaksi
 MODBUS_FAIL_LIMIT = 3        # peräkkäiset lukuvirheet ennen kuin Modbus merkitään offline-tilaan
 
