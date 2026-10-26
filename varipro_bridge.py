@@ -29,7 +29,7 @@ import time
 from dataclasses import dataclass
 from datetime import datetime
 
-__version__ = "2.0.0"
+__version__ = "2026.10.1"
 
 logger = logging.getLogger("varipro")
 

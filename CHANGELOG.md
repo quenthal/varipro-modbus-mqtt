@@ -1,6 +1,8 @@
 # Muutokset
 
-## 2.0.0
+Versiot: `VUOSI.KUUKAUSI.N` (N = kuukauden julkaisun järjestysnumero). Edellinen versio oli 1.x.
+
+## 2026.10.1
 
 Luotettavuusjulkaisu. Topicit ja Home Assistantin `unique_id`:t ovat ennallaan;
 päivitysohje: README → "Päivitys versiosta 1.x".
